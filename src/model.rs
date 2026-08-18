@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{bail, Result};
+use rayon::prelude::*;
 
 use crate::background::AmbientModel;
 use crate::dataset::{GuideDataset, GuideObservation};
@@ -16,6 +17,7 @@ pub struct FitConfig {
     // Biological convergence.
     pub posterior_tolerance: f64,
     pub stable_iterations_required: usize,
+    pub call_posterior_threshold: f64,
 
     pub initial_prior_real: f64,
     pub initial_dispersion: f64,
@@ -37,6 +39,9 @@ impl Default for FitConfig {
 
             // Require biological stability several times in a row.
             stable_iterations_required: 5,
+
+            // cutoff for calling 
+            call_posterior_threshold: 0.95,
 
             initial_prior_real: 0.05,
             initial_dispersion: 10.0,
@@ -202,54 +207,54 @@ pub fn fit_mixture(
          * genuine observation:
          *   X_cg = A_cg + T_cg
          */
-        for state in &mut observations {
-            let obs = state.observation;
+        observations
+            .par_iter_mut()
+            .for_each(|state| {
+                let obs = state.observation;
 
-            let guide =
-                &guides[obs.guide_id as usize];
+                let guide = &guides[obs.guide_id as usize];
 
-            let lambda =
-                lambda_by_cell[&obs.cell_id];
+                let lambda = lambda_by_cell[&obs.cell_id];
 
-            let ambient_mean =
-                lambda * ambient.p(obs.guide_id);
+                let ambient_mean =
+                    lambda * ambient.p(obs.guide_id);
 
-            let posterior = posterior_real(
-                obs.count,
-                ambient_mean,
-                guide.prior_real,
-                guide.mean,
-                guide.theta,
-            );
-
-            /*
-             * Even when the guide is genuinely present, part of the
-             * observed count may still be ambient.
-             */
-            let ambient_if_real =
-                expected_ambient_given_true(
+                let posterior = posterior_real(
                     obs.count,
                     ambient_mean,
+                    guide.prior_real,
                     guide.mean,
                     guide.theta,
                 );
 
-            state.posterior_real = posterior;
+                /*
+                 * Even when the guide is genuinely present, part of the
+                 * observed count may still be ambient.
+                 */
+                let ambient_if_real =
+                    expected_ambient_given_true(
+                        obs.count,
+                        ambient_mean,
+                        guide.mean,
+                        guide.theta,
+                    );
 
-            state.expected_ambient =
-                (1.0 - posterior)
-                    * obs.count as f64
-                + posterior
-                    * ambient_if_real;
+                state.posterior_real = posterior;
 
-            state.expected_true =
-                posterior
-                    * (
-                        obs.count as f64
-                            - ambient_if_real
-                    )
-                    .max(0.0);
-        }
+                state.expected_ambient =
+                    (1.0 - posterior)
+                        * obs.count as f64
+                    + posterior
+                        * ambient_if_real;
+
+                state.expected_true =
+                    posterior
+                        * (
+                            obs.count as f64
+                                - ambient_if_real
+                        )
+                        .max(0.0);
+            });
 
         /*
          * ============================================================
@@ -270,66 +275,41 @@ pub fn fit_mixture(
                 "number/order of observations changed during fitting"
             );
 
-            max_posterior_delta = 0.0;
-            let mut sum_posterior_delta = 0.0;
+            let (changed, max_delta, sum_delta) = previous_posteriors
+                .par_iter()
+                .zip(observations.par_iter())
+                .map(|(previous, state)| {
+                    let current = state.posterior_real;
+                    let delta = (current - *previous).abs();
 
-            for (previous, state) in previous_posteriors
-                .iter()
-                .zip(observations.iter())
-            {
-                let current =
-                    state.posterior_real;
+                    let previous_call = *previous >= cfg.call_posterior_threshold;
+                    let current_call = current >= cfg.call_posterior_threshold;
 
-                let delta =
-                    (current - *previous).abs();
+                    let changed = usize::from(previous_call != current_call);
 
-                max_posterior_delta =
-                    max_posterior_delta.max(delta);
+                    (changed, delta, delta)
+                })
+                .reduce(
+                    || (0usize, 0.0_f64, 0.0_f64),
+                    |a, b| (
+                        a.0 + b.0,
+                        a.1.max(b.1),
+                        a.2 + b.2,
+                    ),
+                );
 
-                sum_posterior_delta += delta;
-
-                /*
-                 * This threshold should ideally be part of FitConfig.
-                 *
-                 * If you already added:
-                 *
-                 *     cfg.call_posterior_threshold
-                 *
-                 * use that here instead of 0.95.
-                 */
-                let previous_call =
-                    *previous >= 0.95;
-
-                let current_call =
-                    current >= 0.95;
-
-                if previous_call != current_call {
-                    changed_calls += 1;
-                }
-            }
-
+            changed_calls = changed;
+            max_posterior_delta = max_delta;
             mean_posterior_delta =
-                sum_posterior_delta
-                    / observations.len() as f64;
+                sum_delta / observations.len() as f64;
 
-            /*
-             * Biological stability means:
-             *
-             * 1. no cell-guide assignment changed
-             * 2. posterior probabilities themselves barely moved
-             */
-            let biologically_stable_this_iteration =
-                changed_calls == 0;
-
-            if biologically_stable_this_iteration {
+            if changed_calls == 0 {
                 stable_iterations += 1;
             } else {
                 stable_iterations = 0;
             }
 
-            if stable_iterations
-                >= cfg.stable_iterations_required
-            {
+            if stable_iterations >= cfg.stable_iterations_required {
                 biological_converged = true;
             }
         }

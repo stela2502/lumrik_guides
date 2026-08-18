@@ -457,6 +457,7 @@ dependencies = [
  "clap",
  "flate2",
  "mapping_info",
+ "rayon",
  "scdata",
  "statrs",
  "stela-int-to-str 0.2.3",
