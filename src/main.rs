@@ -205,7 +205,7 @@ fn main() -> Result<()> {
         &fitted,
     )?;
 
-    write_cell_guide_assignments(
+    let cell_guide_gaps = write_cell_guide_assignments(
         &cli.out,
         &filtered_index,
         &filtered,
@@ -213,9 +213,7 @@ fn main() -> Result<()> {
     )?;
 
     let multi_gap_stats = MultiGuideGapStats::collect(
-        &filtered_index,
-        &filtered,
-        &calls,
+        &cell_guide_gaps
     );
 
     let n_called =
@@ -413,7 +411,7 @@ fn write_cell_guide_assignments(
     index: &GuideFeatureIndex,
     data: &GuideDataset,
     calls: &GuideCalls,
-) -> Result<()> {
+) -> Result<Vec<(usize, f64)>> {
     let path = out.join("cell_guide_assignments.tsv");
 
     let mut writer = BufWriter::new(
@@ -441,6 +439,13 @@ fn write_cell_guide_assignments(
             )
         })
         .collect();
+
+    /*
+     * Collect the already-calculated cell-level posterior gaps
+     * while writing the annotation table.
+     */
+    let mut cell_guide_gaps =
+        Vec::with_capacity(data.cell_ids.len());
 
     /*
      * Cell-level annotation columns.
@@ -522,6 +527,11 @@ fn write_cell_guide_assignments(
             &call_lookup,
         );
 
+        cell_guide_gaps.push((
+            n_called,
+            ranked.posterior_gap,
+        ));
+
         write!(
             writer,
             "{}\t{}\t{}\t{}\t{}\t{:.8}\t{}\t{:.8}\t{:.8}",
@@ -564,5 +574,5 @@ fn write_cell_guide_assignments(
 
     writer.flush()?;
 
-    Ok(())
+    Ok(cell_guide_gaps)
 }

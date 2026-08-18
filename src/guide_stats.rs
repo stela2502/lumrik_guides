@@ -1,50 +1,40 @@
-//guide_stats.rs
-
 // src/guide_stants.rs
 
-use std::collections::{BTreeMap, HashMap};
-use std::fmt::{Display, Formatter, Result as FmtResult};
-
-use crate::{
-    GuideDataset,
-    GuideFeatureIndex,
-};
-use crate::caller::{
-    GuideCall,
-    GuideCalls,
-};
-
 use anyhow::{Context, Result};
+use std::collections::BTreeMap;
+use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
 
-pub trait MultiGuideGapStatsTable {
-    fn write_table(
-        &self,
-        out: &PathBuf,
-    ) -> Result<()>;
-
-    fn print_table(&self);
+/// Cell-level information needed for posterior-gap statistics.
+///
+/// The posterior gap itself is calculated upstream when the guides
+/// are ranked for the cell. This module only summarizes those values.
+#[derive(Debug, Clone)]
+pub struct CellGuideGap {
+    pub n_called_guides: usize,
+    pub posterior_gap: f64,
 }
+
 
 #[derive(Debug, Clone)]
 pub struct MultiGuideGapStats {
-    /// Exact number of called guides.
-    ///
-    /// None represents the combined statistics across all multi-guide cells.
     n_called_guides: Option<usize>,
-
     n_cells: usize,
 
     mean: f64,
 
-    /// Sample standard deviation.
-    ///
-    /// None if only one cell is present in the group.
-    std_dev: Option<f64>,
+    min: f64,
+    q1: f64,
+    median: f64,
+    q3: f64,
+    p90: f64,
+    p95: f64,
+    max: f64,
 }
+
 
 impl MultiGuideGapStats {
     pub fn new(
@@ -56,146 +46,269 @@ impl MultiGuideGapStats {
             "cannot calculate statistics from an empty value set"
         );
 
-        let n_cells = values.len();
+        let mut sorted = values.to_vec();
+
+        sorted.sort_unstable_by(|a, b| {
+            a.total_cmp(b)
+        });
+
+        let n_cells = sorted.len();
 
         let mean =
-            values.iter().sum::<f64>()
+            sorted.iter().sum::<f64>()
                 / n_cells as f64;
-
-        let std_dev = if n_cells > 1 {
-            let variance = values
-                .iter()
-                .map(|value| {
-                    let diff = *value - mean;
-                    diff * diff
-                })
-                .sum::<f64>()
-                / (n_cells - 1) as f64;
-
-            Some(variance.sqrt())
-        } else {
-            None
-        };
 
         Self {
             n_called_guides,
             n_cells,
+
             mean,
-            std_dev,
+
+            min: sorted[0],
+            q1: quantile(&sorted, 0.25),
+            median: quantile(&sorted, 0.50),
+            q3: quantile(&sorted, 0.75),
+            p90: quantile(&sorted, 0.90),
+            p95: quantile(&sorted, 0.95),
+            max: *sorted
+                .last()
+                .expect("sorted values unexpectedly empty"),
         }
     }
 
-    pub fn n_called_guides(&self) -> Option<usize> {
-        self.n_called_guides
-    }
 
-    pub fn n_cells(&self) -> usize {
-        self.n_cells
-    }
-
-    pub fn mean(&self) -> f64 {
-        self.mean
-    }
-
-    pub fn std_dev(&self) -> Option<f64> {
-        self.std_dev
-    }
-
-    pub fn group_name(&self) -> String {
-        self.n_called_guides
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "ALL".to_string())
-    }
-
-    /// Collect posterior-gap statistics for all cells with >= 2 called guides.
+    /// Build statistics from posterior gaps that have already been
+    /// calculated at the cell level.
     ///
-    /// The returned vector contains:
-    ///
-    ///  one entry for every exact guide multiplicit
-    ///  followed by one combined ALL entry.
+    /// Only cells with >= 2 called guides contribute.
     pub fn collect(
-        index: &GuideFeatureIndex,
-        data: &GuideDataset,
-        calls: &GuideCalls,
+        gaps: &[(usize, f64)],
     ) -> Vec<Self> {
-        let call_lookup: HashMap<(u64, u32), &GuideCall> = calls
-            .flat
-            .iter()
-            .map(|call| {
-                (
-                    (call.cell_id, call.guide_id),
-                    call,
-                )
-            })
-            .collect();
-
         let mut by_multiplicity:
             BTreeMap<usize, Vec<f64>> =
             BTreeMap::new();
 
         let mut all_multi = Vec::new();
 
-        for &cell_id in &data.cell_ids {
-            let n_called =
-                calls.called_for_cell(cell_id).count();
-
-            if n_called < 2 {
+        for gap in gaps {
+            if gap.0 < 2 {
                 continue;
             }
 
-            let gap = posterior_gap_for_cell(
-                cell_id,
-                index,
-                &call_lookup,
-            );
-
             by_multiplicity
-                .entry(n_called)
+                .entry(gap.0)
                 .or_default()
-                .push(gap);
+                .push(gap.1);
 
-            all_multi.push(gap);
+            all_multi.push(
+                gap.1
+            );
         }
 
-        let mut result = Vec::new();
+        let mut result =
+            Vec::with_capacity(
+                by_multiplicity.len() + 1
+            );
 
         for (n_called_guides, values)
             in by_multiplicity
         {
-            result.push(Self::new(
-                Some(n_called_guides),
-                &values,
-            ));
+            result.push(
+                Self::new(
+                    Some(n_called_guides),
+                    &values,
+                )
+            );
         }
 
         if !all_multi.is_empty() {
-            result.push(Self::new(
-                None,
-                &all_multi,
-            ));
+            result.push(
+                Self::new(
+                    None,
+                    &all_multi,
+                )
+            );
         }
 
         result
     }
 
-    /// Header matching Display output.
+
+    pub fn n_called_guides(
+        &self,
+    ) -> Option<usize> {
+        self.n_called_guides
+    }
+
+
+    pub fn n_cells(
+        &self,
+    ) -> usize {
+        self.n_cells
+    }
+
+
+    pub fn mean(
+        &self,
+    ) -> f64 {
+        self.mean
+    }
+
+
+    pub fn min(
+        &self,
+    ) -> f64 {
+        self.min
+    }
+
+
+    pub fn q1(
+        &self,
+    ) -> f64 {
+        self.q1
+    }
+
+
+    pub fn median(
+        &self,
+    ) -> f64 {
+        self.median
+    }
+
+
+    pub fn q3(
+        &self,
+    ) -> f64 {
+        self.q3
+    }
+
+
+    pub fn p90(
+        &self,
+    ) -> f64 {
+        self.p90
+    }
+
+
+    pub fn p95(
+        &self,
+    ) -> f64 {
+        self.p95
+    }
+
+
+    pub fn max(
+        &self,
+    ) -> f64 {
+        self.max
+    }
+
+
+    pub fn group_name(
+        &self,
+    ) -> String {
+        self.n_called_guides
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "ALL".to_string())
+    }
+
+
     pub fn header() -> &'static str {
-        "called_guides\tcells\tmean_posterior_gap\tstd_posterior_gap"
+        concat!(
+            "called_guides",
+            "\tcells",
+            "\tmean",
+            "\tmin",
+            "\tq1",
+            "\tmedian",
+            "\tq3",
+            "\tp90",
+            "\tp95",
+            "\tmax"
+        )
     }
 }
 
+
+impl Display for MultiGuideGapStats {
+    fn fmt(
+        &self,
+        f: &mut Formatter<'_>,
+    ) -> FmtResult {
+        write!(
+            f,
+            concat!(
+                "{}\t{}",
+                "\t{:.8}",
+                "\t{:.8}",
+                "\t{:.8}",
+                "\t{:.8}",
+                "\t{:.8}",
+                "\t{:.8}",
+                "\t{:.8}",
+                "\t{:.8}"
+            ),
+            self.group_name(),
+            self.n_cells,
+            self.mean,
+            self.min,
+            self.q1,
+            self.median,
+            self.q3,
+            self.p90,
+            self.p95,
+            self.max,
+        )
+    }
+}
+
+
+pub trait MultiGuideGapStatsTable {
+    fn print_table(
+        &self,
+    );
+
+    fn write_table(
+        &self,
+        out: &PathBuf,
+    ) -> Result<()>;
+}
+
+
 impl MultiGuideGapStatsTable for [MultiGuideGapStats] {
+    fn print_table(
+        &self,
+    ) {
+        println!(
+            "Multi-guide posterior-gap statistics"
+        );
+
+        println!(
+            "{}",
+            MultiGuideGapStats::header()
+        );
+
+        for stat in self {
+            println!("{stat}");
+        }
+    }
+
+
     fn write_table(
         &self,
         out: &PathBuf,
     ) -> Result<()> {
-        let path =
-            out.join("multi_guide_posterior_gap_stats.tsv");
+        let path = out.join(
+            "multi_guide_posterior_gap_stats.tsv"
+        );
 
         let mut writer = BufWriter::new(
             File::create(&path)
                 .with_context(|| {
-                    format!("creating {}", path.display())
+                    format!(
+                        "creating {}",
+                        path.display()
+                    )
                 })?,
         );
 
@@ -206,79 +319,64 @@ impl MultiGuideGapStatsTable for [MultiGuideGapStats] {
         )?;
 
         for stat in self {
-            writeln!(writer, "{stat}")?;
+            writeln!(
+                writer,
+                "{stat}"
+            )?;
         }
 
         writer
             .flush()
             .with_context(|| {
-                format!("flushing {}", path.display())
+                format!(
+                    "flushing {}",
+                    path.display()
+                )
             })?;
 
         Ok(())
     }
-
-    fn print_table(&self) {
-        println!("{}", MultiGuideGapStats::header());
-
-        for stat in self {
-            println!("{stat}");
-        }
-    }
-}
-
-impl Display for MultiGuideGapStats {
-    fn fmt(
-        &self,
-        f: &mut Formatter<'_>,
-    ) -> FmtResult {
-        match self.std_dev {
-            Some(std_dev) => {
-                write!(
-                    f,
-                    "{}\t{}\t{:.8}\t{:.8}",
-                    self.group_name(),
-                    self.n_cells,
-                    self.mean,
-                    std_dev,
-                )
-            }
-
-            None => {
-                write!(
-                    f,
-                    "{}\t{}\t{:.8}\tNA",
-                    self.group_name(),
-                    self.n_cells,
-                    self.mean,
-                )
-            }
-        }
-    }
 }
 
 
-fn posterior_gap_for_cell(
-    cell_id: u64,
-    index: &GuideFeatureIndex,
-    call_lookup: &HashMap<(u64, u32), &GuideCall>,
+fn quantile(
+    values: &[f64],
+    q: f64,
 ) -> f64 {
-    let mut best = 0.0_f64;
-    let mut second = 0.0_f64;
+    assert!(
+        !values.is_empty(),
+        "cannot calculate quantile of empty data"
+    );
 
-    for guide_id in 0..index.guides().len() {
-        let posterior = call_lookup
-            .get(&(cell_id, guide_id as u32))
-            .map(|call| call.posterior_real)
-            .unwrap_or(0.0);
+    assert!(
+        (0.0..=1.0).contains(&q),
+        "quantile must be between 0 and 1"
+    );
 
-        if posterior > best {
-            second = best;
-            best = posterior;
-        } else if posterior > second {
-            second = posterior;
-        }
+    if values.len() == 1 {
+        return values[0];
     }
 
-    best - second
+    let position =
+        q * (values.len() - 1) as f64;
+
+    let lower =
+        position.floor() as usize;
+
+    let upper =
+        position.ceil() as usize;
+
+    if lower == upper {
+        return values[lower];
+    }
+
+    let fraction =
+        position - lower as f64;
+
+    values[lower]
+        + fraction
+            * (
+                values[upper]
+                    - values[lower]
+            )
 }
