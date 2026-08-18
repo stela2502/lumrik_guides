@@ -1,23 +1,12 @@
-// src/guide_stants.rs
-
-use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
+use anyhow::{Context, Result};
 
-/// Cell-level information needed for posterior-gap statistics.
-///
-/// The posterior gap itself is calculated upstream when the guides
-/// are ranked for the cell. This module only summarizes those values.
-#[derive(Debug, Clone)]
-pub struct CellGuideGap {
-    pub n_called_guides: usize,
-    pub posterior_gap: f64,
-}
-
+use crate::cell_guide_assignments::CellGuideAssignments;
 
 #[derive(Debug, Clone)]
 pub struct MultiGuideGapStats {
@@ -35,7 +24,6 @@ pub struct MultiGuideGapStats {
     max: f64,
 }
 
-
 impl MultiGuideGapStats {
     pub fn new(
         n_called_guides: Option<usize>,
@@ -47,42 +35,27 @@ impl MultiGuideGapStats {
         );
 
         let mut sorted = values.to_vec();
-
-        sorted.sort_unstable_by(|a, b| {
-            a.total_cmp(b)
-        });
+        sorted.sort_unstable_by(f64::total_cmp);
 
         let n_cells = sorted.len();
-
-        let mean =
-            sorted.iter().sum::<f64>()
-                / n_cells as f64;
+        let mean = sorted.iter().sum::<f64>() / n_cells as f64;
 
         Self {
             n_called_guides,
             n_cells,
-
             mean,
-
             min: sorted[0],
             q1: quantile(&sorted, 0.25),
             median: quantile(&sorted, 0.50),
             q3: quantile(&sorted, 0.75),
             p90: quantile(&sorted, 0.90),
             p95: quantile(&sorted, 0.95),
-            max: *sorted
-                .last()
-                .expect("sorted values unexpectedly empty"),
+            max: *sorted.last().expect("non-empty values"),
         }
     }
 
-
-    /// Build statistics from posterior gaps that have already been
-    /// calculated at the cell level.
-    ///
-    /// Only cells with >= 2 called guides contribute.
     pub fn collect(
-        gaps: &[(usize, f64)],
+        assignments: &CellGuideAssignments,
     ) -> Vec<Self> {
         let mut by_multiplicity:
             BTreeMap<usize, Vec<f64>> =
@@ -90,25 +63,19 @@ impl MultiGuideGapStats {
 
         let mut all_multi = Vec::new();
 
-        for gap in gaps {
-            if gap.0 < 2 {
-                continue;
-            }
-
+        for (n_called, log_odds_gap)
+            in assignments.multi_guide_gaps()
+        {
             by_multiplicity
-                .entry(gap.0)
+                .entry(n_called)
                 .or_default()
-                .push(gap.1);
+                .push(log_odds_gap);
 
-            all_multi.push(
-                gap.1
-            );
+            all_multi.push(log_odds_gap);
         }
 
         let mut result =
-            Vec::with_capacity(
-                by_multiplicity.len() + 1
-            );
+            Vec::with_capacity(by_multiplicity.len() + 1);
 
         for (n_called_guides, values)
             in by_multiplicity
@@ -133,91 +100,57 @@ impl MultiGuideGapStats {
         result
     }
 
-
-    pub fn n_called_guides(
-        &self,
-    ) -> Option<usize> {
+    pub fn n_called_guides(&self) -> Option<usize> {
         self.n_called_guides
     }
 
-
-    pub fn n_cells(
-        &self,
-    ) -> usize {
+    pub fn n_cells(&self) -> usize {
         self.n_cells
     }
 
-
-    pub fn mean(
-        &self,
-    ) -> f64 {
+    pub fn mean(&self) -> f64 {
         self.mean
     }
 
-
-    pub fn min(
-        &self,
-    ) -> f64 {
+    pub fn min(&self) -> f64 {
         self.min
     }
 
-
-    pub fn q1(
-        &self,
-    ) -> f64 {
+    pub fn q1(&self) -> f64 {
         self.q1
     }
 
-
-    pub fn median(
-        &self,
-    ) -> f64 {
+    pub fn median(&self) -> f64 {
         self.median
     }
 
-
-    pub fn q3(
-        &self,
-    ) -> f64 {
+    pub fn q3(&self) -> f64 {
         self.q3
     }
 
-
-    pub fn p90(
-        &self,
-    ) -> f64 {
+    pub fn p90(&self) -> f64 {
         self.p90
     }
 
-
-    pub fn p95(
-        &self,
-    ) -> f64 {
+    pub fn p95(&self) -> f64 {
         self.p95
     }
 
-
-    pub fn max(
-        &self,
-    ) -> f64 {
+    pub fn max(&self) -> f64 {
         self.max
     }
 
-
-    pub fn group_name(
-        &self,
-    ) -> String {
+    pub fn group_name(&self) -> String {
         self.n_called_guides
             .map(|n| n.to_string())
             .unwrap_or_else(|| "ALL".to_string())
     }
 
-
     pub fn header() -> &'static str {
         concat!(
             "called_guides",
             "\tcells",
-            "\tmean",
+            "\tmean_log_odds_gap",
             "\tmin",
             "\tq1",
             "\tmedian",
@@ -229,7 +162,6 @@ impl MultiGuideGapStats {
     }
 }
 
-
 impl Display for MultiGuideGapStats {
     fn fmt(
         &self,
@@ -237,17 +169,7 @@ impl Display for MultiGuideGapStats {
     ) -> FmtResult {
         write!(
             f,
-            concat!(
-                "{}\t{}",
-                "\t{:.8}",
-                "\t{:.8}",
-                "\t{:.8}",
-                "\t{:.8}",
-                "\t{:.8}",
-                "\t{:.8}",
-                "\t{:.8}",
-                "\t{:.8}"
-            ),
+            "{}\t{}\t{:.8}\t{:.8}\t{:.8}\t{:.8}\t{:.8}\t{:.8}\t{:.8}\t{:.8}",
             self.group_name(),
             self.n_cells,
             self.mean,
@@ -264,53 +186,33 @@ impl Display for MultiGuideGapStats {
 
 
 pub trait MultiGuideGapStatsTable {
-    fn print_table(
-        &self,
-    );
-
+    fn print_table(&self);
     fn write_table(
         &self,
         out: &PathBuf,
     ) -> Result<()>;
 }
 
-
 impl MultiGuideGapStatsTable for [MultiGuideGapStats] {
-    fn print_table(
-        &self,
-    ) {
-        println!(
-            "Multi-guide posterior-gap statistics"
-        );
-
-        println!(
-            "{}",
-            MultiGuideGapStats::header()
-        );
+    fn print_table(&self) {
+        println!("Multi-guide log-odds-gap statistics");
+        println!("{}", MultiGuideGapStats::header());
 
         for stat in self {
             println!("{stat}");
         }
     }
 
-
     fn write_table(
         &self,
         out: &PathBuf,
     ) -> Result<()> {
-        let path = out.join(
-            "multi_guide_posterior_gap_stats.tsv"
-        );
+        let path =
+            out.join("multi_guide_log_odds_gap_stats.tsv");
 
-        let mut writer = BufWriter::new(
-            File::create(&path)
-                .with_context(|| {
-                    format!(
-                        "creating {}",
-                        path.display()
-                    )
-                })?,
-        );
+        let file = File::create(&path)
+            .with_context(|| format!("creating {}", path.display()))?;
+        let mut writer = BufWriter::new(file);
 
         writeln!(
             writer,
@@ -319,20 +221,12 @@ impl MultiGuideGapStatsTable for [MultiGuideGapStats] {
         )?;
 
         for stat in self {
-            writeln!(
-                writer,
-                "{stat}"
-            )?;
+            writeln!(writer, "{stat}")?;
         }
 
         writer
             .flush()
-            .with_context(|| {
-                format!(
-                    "flushing {}",
-                    path.display()
-                )
-            })?;
+            .with_context(|| format!("flushing {}", path.display()))?;
 
         Ok(())
     }
@@ -375,8 +269,5 @@ fn quantile(
 
     values[lower]
         + fraction
-            * (
-                values[upper]
-                    - values[lower]
-            )
+            * (values[upper] - values[lower])
 }

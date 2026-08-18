@@ -75,21 +75,64 @@ pub fn expected_ambient_given_true(
         .sum()
 }
 
-pub fn posterior_real(
-    x: u32,
-    ambient_mean: f64,
-    prior_real: f64,
-    true_mean: f64,
-    theta: f64,
-) -> f64 {
-    let prior = prior_real.clamp(1e-9, 1.0 - 1e-9);
+#[derive(Debug, Clone, Copy)]
+pub struct PosteriorEvidence {
+    pub probability: f64,
+    pub log_odds: f64,
+}
 
-    let l0 = (1.0 - prior).ln() + poisson_log_pmf(x, ambient_mean);
-    let l1 = prior.ln()
-        + true_convolution_log_pmf(x, ambient_mean, true_mean, theta);
+impl Default for PosteriorEvidence {
+    fn default() -> Self {
+        Self {
+            probability: 0.0,
+            log_odds: f64::NEG_INFINITY,
+        }
+    }
+}
 
-    let denom = logsumexp(&[l0, l1]);
-    (l1 - denom).exp().clamp(0.0, 1.0)
+impl PosteriorEvidence {
+    pub fn new(
+        x: u32,
+        ambient_mean: f64,
+        prior_real: f64,
+        true_mean: f64,
+        theta: f64,
+    ) -> Self {
+        let prior =
+            prior_real.clamp(1e-9, 1.0 - 1e-9);
+
+        let l0 =
+            (1.0 - prior).ln()
+            + poisson_log_pmf(
+                x,
+                ambient_mean,
+            );
+
+        let l1 =
+            prior.ln()
+            + true_convolution_log_pmf(
+                x,
+                ambient_mean,
+                true_mean,
+                theta,
+            );
+
+        let log_odds =
+            l1 - l0;
+
+        let denom =
+            logsumexp(&[l0, l1]);
+
+        let probability =
+            (l1 - denom)
+                .exp()
+                .clamp(0.0, 1.0);
+
+        Self {
+            probability,
+            log_odds,
+        }
+    }
 }
 
 pub fn poisson_upper_tail(x: u32, lambda: f64) -> f64 {
@@ -140,13 +183,13 @@ mod tests {
 
     #[test]
     fn strong_signal_gets_large_posterior() {
-        let z = posterior_real(50, 0.2, 0.05, 40.0, 10.0);
-        assert!(z > 0.99);
+        let z = PosteriorEvidence::new(50, 0.2, 0.05, 40.0, 10.0);
+        assert!(z.probability > 0.99);
     }
 
     #[test]
     fn ambient_like_signal_stays_small() {
-        let z = posterior_real(2, 2.0, 0.05, 40.0, 10.0);
-        assert!(z < 0.5);
+        let z = PosteriorEvidence::new(2, 2.0, 0.05, 40.0, 10.0);
+        assert!(z.probability < 0.5);
     }
 }

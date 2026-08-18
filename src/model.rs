@@ -5,16 +5,14 @@ use rayon::prelude::*;
 
 use crate::background::AmbientModel;
 use crate::dataset::{GuideDataset, GuideObservation};
-use crate::stats::{expected_ambient_given_true, posterior_real};
+use crate::stats::{expected_ambient_given_true, PosteriorEvidence};
 
 #[derive(Debug, Clone)]
 pub struct FitConfig {
     pub max_iterations: usize,
-
-    // Existing mathematical convergence.
     pub tolerance: f64,
 
-    // Biological convergence.
+    // Biological convergence diagnostics.
     pub posterior_tolerance: f64,
     pub stable_iterations_required: usize,
     pub minimum_posterior: f64,
@@ -27,16 +25,12 @@ pub struct FitConfig {
     pub prior_beta: f64,
 }
 
-
 #[derive(Debug, Clone)]
 pub struct FitIteration {
     pub iteration: usize,
-
     pub max_parameter_delta: f64,
-
     pub max_posterior_delta: f64,
     pub mean_posterior_delta: f64,
-
     pub changed_calls: usize,
     pub total_observations: usize,
 }
@@ -54,7 +48,7 @@ pub struct GuideExpressionModel {
 #[derive(Debug, Clone)]
 pub struct ObservationFit {
     pub observation: GuideObservation,
-    pub posterior_real: f64,
+    pub evidence: PosteriorEvidence,
     pub expected_ambient: f64,
     pub expected_true: f64,
 }
@@ -65,15 +59,11 @@ pub struct FittedModel {
     pub guides: Vec<GuideExpressionModel>,
     pub lambda_by_cell: HashMap<u64, f64>,
     pub observations: Vec<ObservationFit>,
-
     pub iterations: usize,
-
     pub mathematical_converged: bool,
     pub biological_converged: bool,
-
     pub diagnostics: Vec<FitIteration>,
 }
-
 
 pub fn fit_mixture(
     data: &GuideDataset,
@@ -88,16 +78,6 @@ pub fn fit_mixture(
         bail!("Cannot fit guide model without filtered cells");
     }
 
-    /*
-     * Initial estimate:
-     *
-     * lambda_c = total observed guide burden in the cell.
-     *
-     * This deliberately overestimates ambient burden initially because
-     * genuine guide molecules are still included. The EM iterations will
-     * subsequently separate expected ambient and expected true-guide
-     * molecules.
-     */
     let mut lambda_by_cell: HashMap<u64, f64> = data
         .cell_ids
         .iter()
@@ -105,178 +85,64 @@ pub fn fit_mixture(
         .map(|cell_id| {
             (
                 cell_id,
-                (data.cell_total(cell_id) as f64)
-                    .max(cfg.minimum_lambda),
+                (data.cell_total(cell_id) as f64).max(cfg.minimum_lambda),
             )
         })
         .collect();
 
-    /*
-     * Initial guide-specific true-expression models.
-     */
-    let mut guides =
-        initialize_guides(
-            data,
-            &ambient,
-            &lambda_by_cell,
-            cfg,
-        );
+    let mut guides = initialize_guides(data, &ambient, &lambda_by_cell, cfg);
 
-    /*
-     * Flatten the guide-major observations.
-     *
-     * Their order never changes during fitting. This is important:
-     * previous_posteriors[i] always refers to observations[i].
-     */
+    // Keep guide boundaries once. Because observations are flattened in
+    // guide-major order, the M-step can work on slices without allocating a
+    // Vec<&ObservationFit> for every guide on every iteration.
+    let mut guide_ranges = Vec::with_capacity(data.by_guide.len());
+    let mut offset = 0usize;
+    for guide in &data.by_guide {
+        let end = offset + guide.len();
+        guide_ranges.push(offset..end);
+        offset = end;
+    }
+
+    // Flattening preserves guide-major order and gives Rayon one contiguous
+    // mutable slice for the E-step.
     let mut observations: Vec<ObservationFit> = data
         .by_guide
         .iter()
         .flat_map(|guide| guide.iter().copied())
         .map(|observation| ObservationFit {
             observation,
-            posterior_real: 0.0,
+            evidence: PosteriorEvidence::default(),
             expected_ambient: observation.count as f64,
             expected_true: 0.0,
         })
         .collect();
 
-    /*
-     * Biological convergence state.
-     *
-     * Empty means that no previous biological state exists yet.
-     * After the first E-step this vector receives the first set of
-     * posteriors.
-     */
-    let mut previous_posteriors: Vec<f64> = Vec::new();
-
+    let mut previous_posteriors: Vec<f64> = Vec::with_capacity(observations.len());
     let mut stable_iterations = 0usize;
-
     let mut mathematical_converged = false;
     let mut biological_converged = false;
-
     let mut iterations = 0usize;
-
-    let mut diagnostics = Vec::new();
+    let mut diagnostics = Vec::with_capacity(cfg.max_iterations);
 
     for iter in 0..cfg.max_iterations {
         iterations = iter + 1;
 
-        /*
-         * ============================================================
-         * E STEP
-         * ============================================================
-         *
-         * For every observed cell/guide pair calculate:
-         *
-         *   P(real guide | observed count)
-         *
-         * using
-         *
-         * ambient:
-         *   A_cg ~ Poisson(lambda_c * p_g)
-         *
-         * true guide:
-         *   T_cg ~ NB(mu_g, theta_g)
-         *
-         * genuine observation:
-         *   X_cg = A_cg + T_cg
-         */
-        observations
-            .par_iter_mut()
-            .for_each(|state| {
-                let obs = state.observation;
+        // E-step: each observation is independent for fixed model parameters.
+        update_observations(
+            &mut observations,
+            &guides,
+            &lambda_by_cell,
+            &ambient,
+        );
 
-                let guide = &guides[obs.guide_id as usize];
-
-                let lambda = lambda_by_cell[&obs.cell_id];
-
-                let ambient_mean =
-                    lambda * ambient.p(obs.guide_id);
-
-                let posterior = posterior_real(
-                    obs.count,
-                    ambient_mean,
-                    guide.prior_real,
-                    guide.mean,
-                    guide.theta,
-                );
-
-                /*
-                 * Even when the guide is genuinely present, part of the
-                 * observed count may still be ambient.
-                 */
-                let ambient_if_real =
-                    expected_ambient_given_true(
-                        obs.count,
-                        ambient_mean,
-                        guide.mean,
-                        guide.theta,
-                    );
-
-                state.posterior_real = posterior;
-
-                state.expected_ambient =
-                    (1.0 - posterior)
-                        * obs.count as f64
-                    + posterior
-                        * ambient_if_real;
-
-                state.expected_true =
-                    posterior
-                        * (
-                            obs.count as f64
-                                - ambient_if_real
-                        )
-                        .max(0.0);
-            });
-
-        /*
-         * ============================================================
-         * BIOLOGICAL STABILITY
-         * ============================================================
-         *
-         * Compare the current posterior assignment state against the
-         * previous iteration BEFORE changing previous_posteriors.
-         */
-        let mut changed_calls = 0usize;
-        let mut max_posterior_delta = f64::INFINITY;
-        let mut mean_posterior_delta = f64::INFINITY;
-
-        if !previous_posteriors.is_empty() {
-            assert_eq!(
-                previous_posteriors.len(),
-                observations.len(),
-                "number/order of observations changed during fitting"
+        let (changed_calls, max_posterior_delta, mean_posterior_delta) =
+            posterior_change_stats(
+                &previous_posteriors,
+                &observations,
+                cfg.minimum_posterior,
             );
 
-            let (changed, max_delta, sum_delta) = previous_posteriors
-                .par_iter()
-                .zip(observations.par_iter())
-                .map(|(previous, state)| {
-                    let current = state.posterior_real;
-                    let delta = (current - *previous).abs();
-
-                    let previous_call = *previous >= cfg.minimum_posterior;
-                    let current_call = current >= cfg.minimum_posterior;
-
-                    let changed = usize::from(previous_call != current_call);
-
-                    (changed, delta, delta)
-                })
-                .reduce(
-                    || (0usize, 0.0_f64, 0.0_f64),
-                    |a, b| (
-                        a.0 + b.0,
-                        a.1.max(b.1),
-                        a.2 + b.2,
-                    ),
-                );
-
-            changed_calls = changed;
-            max_posterior_delta = max_delta;
-            mean_posterior_delta =
-                sum_delta / observations.len() as f64;
-
+        if !previous_posteriors.is_empty() {
             if changed_calls == 0 {
                 stable_iterations += 1;
             } else {
@@ -288,50 +154,19 @@ pub fn fit_mixture(
             }
         }
 
-        /*eprintln!(
-            "iter {:>3}: changed_calls={:>5}, stable={:>3}, max_post_delta={:.6e}",
-            iter + 1,
-            changed_calls,
-            stable_iterations,
-            max_posterior_delta,
-        );*/
-
-        /*
-         * ONLY NOW replace the old biological state.
-         *
-         * Nothing below this point needs the previous iteration's
-         * posterior vector.
-         */
+        // Reuse the allocated buffer rather than clear + extend through a
+        // second temporary collection.
         previous_posteriors.clear();
-
         previous_posteriors.extend(
             observations
                 .iter()
-                .map(|state| state.posterior_real),
+                .map(|state| state.evidence.probability),
         );
 
-        /*
-         * ============================================================
-         * SAVE OLD PARAMETERS
-         * ============================================================
-         *
-         * Needed for mathematical convergence diagnostics after the
-         * M-step.
-         */
-        let old_lambda =
-            lambda_by_cell.clone();
+        let old_lambda = lambda_by_cell.clone();
+        let old_guides = guides.clone();
 
-        let old_guides =
-            guides.clone();
-
-        /*
-         * ============================================================
-         * M STEP: CELL-SPECIFIC AMBIENT BURDEN
-         * ============================================================
-         *
-         * lambda_c becomes the expected number of ambient guide
-         * molecules in that cell.
-         */
+        // M-step: cell-specific expected ambient burden.
         for value in lambda_by_cell.values_mut() {
             *value = cfg.minimum_lambda;
         }
@@ -339,297 +174,100 @@ pub fn fit_mixture(
         for state in &observations {
             *lambda_by_cell
                 .entry(state.observation.cell_id)
-                .or_insert(cfg.minimum_lambda)
-                += state.expected_ambient;
+                .or_insert(cfg.minimum_lambda) += state.expected_ambient;
         }
 
-        /*
-         * ============================================================
-         * M STEP: GUIDE-SPECIFIC TRUE EXPRESSION
-         * ============================================================
-         */
-        let n_cells =
-            data.n_cells() as f64;
+        // M-step: guide-specific true-expression component.
+        let n_cells = data.n_cells() as f64;
 
         for guide_id in 0..guides.len() {
-            /*
-             * Gather observations belonging to this guide.
-             *
-             * We keep the guide-major structure in GuideDataset, but the
-             * EM observation state is flattened. With only a modest
-             * number of guides this is fine for now.
-             */
-            let states: Vec<&ObservationFit> = observations
-                .iter()
-                .filter(|state| {
-                    state.observation.guide_id as usize
-                        == guide_id
-                })
-                .collect();
+            let states = &observations[guide_ranges[guide_id].clone()];
 
-            /*
-             * Expected number of genuinely positive cells for guide g.
-             */
             let sum_z: f64 = states
                 .iter()
-                .map(|state| state.posterior_real)
+                .map(|state| state.evidence.probability)
                 .sum();
 
-            /*
-             * Expected number of true guide molecules.
-             */
             let sum_true: f64 = states
                 .iter()
                 .map(|state| state.expected_true)
                 .sum();
 
-            /*
-             * Guide-specific probability that an arbitrary cell
-             * genuinely contains this guide.
-             *
-             * Beta prior prevents pathological zero/one estimates.
-             */
-            let prior_real =
-                (sum_z + cfg.prior_alpha)
-                    / (
-                        n_cells
-                            + cfg.prior_alpha
-                            + cfg.prior_beta
-                    );
+            let prior_real = (sum_z + cfg.prior_alpha)
+                / (n_cells + cfg.prior_alpha + cfg.prior_beta);
 
-            /*
-             * Mean true-guide expression conditional on genuine guide
-             * presence.
-             */
-            let true_mean =
-                if sum_z > 1e-8 {
-                    (
-                        sum_true / sum_z
-                    )
-                    .max(cfg.minimum_true_mean)
-                } else {
-                    cfg.minimum_true_mean
-                };
+            let true_mean = if sum_z > 1e-8 {
+                (sum_true / sum_z).max(cfg.minimum_true_mean)
+            } else {
+                cfg.minimum_true_mean
+            };
 
-            /*
-             * Approximate NB dispersion using a posterior-weighted
-             * method-of-moments estimate.
-             *
-             * If variance <= mean, the NB approaches Poisson, represented
-             * here by a very large theta.
-             */
             let mut weighted_variance = 0.0;
 
             if sum_z > 1e-8 {
-                for state in &states {
-                    let inferred_true =
-                        if state.posterior_real > 1e-12 {
-                            state.expected_true
-                                / state.posterior_real
-                        } else {
-                            0.0
-                        };
+                for state in states {
+                    let posterior = state.evidence.probability;
+                    let inferred_true = if posterior > 1e-12 {
+                        state.expected_true / posterior
+                    } else {
+                        0.0
+                    };
 
                     weighted_variance +=
-                        state.posterior_real
-                            * (
-                                inferred_true
-                                    - true_mean
-                            )
-                            .powi(2);
+                        posterior * (inferred_true - true_mean).powi(2);
                 }
 
                 weighted_variance /= sum_z;
             }
 
-            let theta =
-                if weighted_variance
-                    > true_mean + 1e-8
-                {
-                    (
-                        true_mean * true_mean
-                            / (
-                                weighted_variance
-                                    - true_mean
-                            )
-                    )
+            let theta = if weighted_variance > true_mean + 1e-8 {
+                (true_mean * true_mean / (weighted_variance - true_mean))
                     .clamp(0.05, 1e6)
-                } else {
-                    /*
-                     * Very high theta means that the NB approaches a
-                     * Poisson distribution.
-                     */
-                    1e6
-                };
+            } else {
+                // Very high theta means the NB approaches a Poisson.
+                1e6
+            };
 
-            guides[guide_id] =
-                GuideExpressionModel {
-                    prior_real:
-                        prior_real.clamp(
-                            1e-9,
-                            1.0 - 1e-9,
-                        ),
-                    mean: true_mean,
-                    theta,
-                };
+            guides[guide_id] = GuideExpressionModel {
+                prior_real: prior_real.clamp(1e-9, 1.0 - 1e-9),
+                mean: true_mean,
+                theta,
+            };
         }
 
-        /*
-         * ============================================================
-         * MATHEMATICAL CONVERGENCE
-         * ============================================================
-         */
-        let mut max_parameter_delta =
-            0.0_f64;
-
-        for (&cell_id, &new_value)
-            in &lambda_by_cell
-        {
-            let old_value = old_lambda
-                .get(&cell_id)
-                .copied()
-                .unwrap_or(new_value);
-
-            max_parameter_delta =
-                max_parameter_delta.max(
-                    relative_delta(
-                        old_value,
-                        new_value,
-                    ),
-                );
-        }
-
-        for (old, new) in
-            old_guides.iter().zip(&guides)
-        {
-            max_parameter_delta =
-                max_parameter_delta.max(
-                    relative_delta(
-                        old.prior_real,
-                        new.prior_real,
-                    ),
-                );
-
-            max_parameter_delta =
-                max_parameter_delta.max(
-                    relative_delta(
-                        old.mean,
-                        new.mean,
-                    ),
-                );
-
-            max_parameter_delta =
-                max_parameter_delta.max(
-                    relative_delta(
-                        old.theta,
-                        new.theta,
-                    ),
-                );
-        }
+        let max_parameter_delta = parameter_delta(
+            &old_lambda,
+            &lambda_by_cell,
+            &old_guides,
+            &guides,
+        );
 
         if max_parameter_delta < cfg.tolerance {
             mathematical_converged = true;
         }
 
-        /*
-         * Record both kinds of convergence.
-         *
-         * The first iteration has no previous biological state, hence
-         * posterior deltas are infinity there.
-         */
-        diagnostics.push(
-            FitIteration {
-                iteration: iter + 1,
-                max_parameter_delta,
-                max_posterior_delta,
-                mean_posterior_delta,
-                changed_calls,
-                total_observations:
-                    observations.len(),
-            },
-        );
+        diagnostics.push(FitIteration {
+            iteration: iter + 1,
+            max_parameter_delta,
+            max_posterior_delta,
+            mean_posterior_delta,
+            changed_calls,
+            total_observations: observations.len(),
+        });
 
-        /*
-         * ============================================================
-         * STOPPING CONDITION
-         * ============================================================
-         *
-         * Either:
-         *
-         * 1. the underlying numerical parameters have converged, OR
-         *
-         * 2. the biological assignments/posteriors have remained stable
-         *    for several consecutive iterations.
-         *
-         * This is deliberate: there is little value in spending another
-         * hundred iterations polishing NB dispersion if the inferred
-         * cell-guide biology is already invariant.
-         */
-        if mathematical_converged
-            || biological_converged
-        {
+        if mathematical_converged || biological_converged {
             break;
         }
     }
 
-    /*
-     * ================================================================
-     * FINAL E STEP
-     * ================================================================
-     *
-     * The final iteration above ends with an M-step.
-     *
-     * Therefore calculate posteriors once more so that every returned
-     * ObservationFit corresponds exactly to the returned final model
-     * parameters.
-     */
-    for state in &mut observations {
-        let obs =
-            state.observation;
-
-        let guide =
-            &guides[obs.guide_id as usize];
-
-        let lambda =
-            lambda_by_cell[&obs.cell_id];
-
-        let ambient_mean =
-            lambda * ambient.p(obs.guide_id);
-
-        let posterior =
-            posterior_real(
-                obs.count,
-                ambient_mean,
-                guide.prior_real,
-                guide.mean,
-                guide.theta,
-            );
-
-        let ambient_if_real =
-            expected_ambient_given_true(
-                obs.count,
-                ambient_mean,
-                guide.mean,
-                guide.theta,
-            );
-
-        state.posterior_real =
-            posterior;
-
-        state.expected_ambient =
-            (1.0 - posterior)
-                * obs.count as f64
-            + posterior
-                * ambient_if_real;
-
-        state.expected_true =
-            posterior
-                * (
-                    obs.count as f64
-                        - ambient_if_real
-                )
-                .max(0.0);
-    }
+    // The loop ends after an M-step, therefore refresh evidence once using
+    // the final parameters. This deliberately reuses the same E-step helper.
+    update_observations(
+        &mut observations,
+        &guides,
+        &lambda_by_cell,
+        &ambient,
+    );
 
     Ok(FittedModel {
         ambient,
@@ -641,6 +279,118 @@ pub fn fit_mixture(
         biological_converged,
         diagnostics,
     })
+}
+
+/// Update posterior evidence and expected latent counts for all observations.
+///
+/// Keeping this in one place prevents the iterative E-step and final refresh
+/// from drifting apart.
+fn update_observations(
+    observations: &mut [ObservationFit],
+    guides: &[GuideExpressionModel],
+    lambda_by_cell: &HashMap<u64, f64>,
+    ambient: &AmbientModel,
+) {
+    observations.par_iter_mut().for_each(|state| {
+        let obs = state.observation;
+        let guide = &guides[obs.guide_id as usize];
+        let lambda = lambda_by_cell[&obs.cell_id];
+        let ambient_mean = lambda * ambient.p(obs.guide_id);
+
+        let evidence = PosteriorEvidence::new(
+            obs.count,
+            ambient_mean,
+            guide.prior_real,
+            guide.mean,
+            guide.theta,
+        );
+
+        let ambient_if_real = expected_ambient_given_true(
+            obs.count,
+            ambient_mean,
+            guide.mean,
+            guide.theta,
+        );
+
+        state.evidence = evidence;
+        state.expected_ambient =
+            (1.0 - evidence.probability) * obs.count as f64
+                + evidence.probability * ambient_if_real;
+        state.expected_true =
+            evidence.probability * (obs.count as f64 - ambient_if_real).max(0.0);
+    });
+}
+
+/// Compare only posterior probabilities between iterations.
+/// Log-odds are retained as evidence for guide ranking, but are not part of
+/// the historical convergence definition.
+fn posterior_change_stats(
+    previous: &[f64],
+    observations: &[ObservationFit],
+    minimum_posterior: f64,
+) -> (usize, f64, f64) {
+    if previous.is_empty() {
+        return (0, f64::INFINITY, f64::INFINITY);
+    }
+
+    assert_eq!(
+        previous.len(),
+        observations.len(),
+        "number/order of observations changed during fitting"
+    );
+
+    let (changed, max_delta, sum_delta) = previous
+        .par_iter()
+        .zip(observations.par_iter())
+        .map(|(previous, state)| {
+            let current = state.evidence.probability;
+            let delta = (current - *previous).abs();
+            let changed = usize::from(
+                (*previous >= minimum_posterior)
+                    != (current >= minimum_posterior),
+            );
+            (changed, delta, delta)
+        })
+        .reduce(
+            || (0usize, 0.0_f64, 0.0_f64),
+            |a, b| (a.0 + b.0, a.1.max(b.1), a.2 + b.2),
+        );
+
+    (
+        changed,
+        max_delta,
+        sum_delta / observations.len() as f64,
+    )
+}
+
+fn parameter_delta(
+    old_lambda: &HashMap<u64, f64>,
+    lambda_by_cell: &HashMap<u64, f64>,
+    old_guides: &[GuideExpressionModel],
+    guides: &[GuideExpressionModel],
+) -> f64 {
+    let lambda_delta = lambda_by_cell
+        .iter()
+        .map(|(&cell_id, &new_value)| {
+            let old_value = old_lambda
+                .get(&cell_id)
+                .copied()
+                .unwrap_or(new_value);
+            relative_delta(old_value, new_value)
+        })
+        .fold(0.0_f64, f64::max);
+
+    let guide_delta = old_guides
+        .iter()
+        .zip(guides)
+        .map(|(old, new)| {
+            relative_delta(old.prior_real, new.prior_real)
+                .max(relative_delta(old.mean, new.mean))
+                .max(relative_delta(old.theta, new.theta))
+        })
+        .fold(0.0_f64, f64::max);
+
+    lambda_delta.max(guide_delta)
 }
 
 fn initialize_guides(
@@ -664,6 +414,7 @@ fn initialize_guides(
                 .collect();
 
             excess.sort_by(f64::total_cmp);
+
             let mean = if excess.is_empty() {
                 cfg.minimum_true_mean
             } else {
