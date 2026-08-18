@@ -40,8 +40,9 @@ struct Cli {
     feature_type: String,
 
     /// Number of worker threads.
-    #[arg(long, default_value_t = 1)]
-    threads: usize,
+    /// If omitted, Rayon uses the available CPU count.
+    #[arg(long)]
+    pub threads: Option<usize>,
 
     #[command(flatten)]
     model: GuideModelCli,
@@ -56,10 +57,12 @@ fn main() -> Result<()> {
     /*
      * Use the same thread count for Rayon-based model fitting.
      */
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(cli.threads.max(1))
-        .build_global()
-        .context("failed to initialize Rayon thread pool")?;
+    if let Some(threads) = cli.threads {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads.max(1))
+            .build_global()
+            .context("failed to initialize Rayon thread pool")?;
+    }
 
     /*
      * Build the 10x input.
@@ -70,8 +73,10 @@ fn main() -> Result<()> {
     );
 
     input.feature_type = cli.feature_type;
-    input.threads = cli.threads;
-
+    input.threads = cli
+        .threads
+        .unwrap_or_else(rayon::current_num_threads);
+        
     let (raw_index, filtered_index) =
         input.indexes()?;
 
