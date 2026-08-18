@@ -4,6 +4,7 @@ pub mod dataset;
 pub mod model;
 pub mod stats;
 pub mod tenx;
+pub mod cli;
 
 pub use background::{AmbientModel, BackgroundConfig};
 pub use caller::{CallConfig, GuideCall, GuideCalls};

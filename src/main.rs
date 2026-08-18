@@ -1,13 +1,19 @@
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
+use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use lumrik_guides::background::{AmbientModel, BackgroundConfig};
-use lumrik_guides::caller::{CallConfig, GuideCalls};
-use lumrik_guides::model::{fit_mixture, FitConfig};
+use lumrik_guides::background::{AmbientModel};
+use lumrik_guides::caller::{GuideCalls};
+use lumrik_guides::model::{fit_mixture};
 use lumrik_guides::tenx::TenxGuideInput;
+use lumrik_guides::cli::GuideModelCli;
+use lumrik_guides::{
+    GuideDataset,
+    GuideFeatureIndex,
+};
 
 use mapping_info::MappingInfo;
 
@@ -25,97 +31,187 @@ struct Cli {
     #[arg(long)]
     filtered: PathBuf,
 
+    /// Output directory.
     #[arg(long)]
     out: PathBuf,
 
+    /// 10x feature type containing the guide counts.
     #[arg(long, default_value = "CRISPR Guide Capture")]
     feature_type: String,
 
+    /// Number of worker threads.
     #[arg(long, default_value_t = 1)]
     threads: usize,
 
-    #[arg(long, default_value_t = 0.5)]
-    ambient_alpha: f64,
-
-    #[arg(long, default_value_t = 0.95)]
-    posterior: f64,
-
-    #[arg(long, default_value_t = 0.05)]
-    fdr: f64,
-
-    #[arg(long, default_value_t = 100)]
-    max_iterations: usize,
+    #[command(flatten)]
+    model: GuideModelCli,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
     fs::create_dir_all(&cli.out)
         .with_context(|| format!("creating {}", cli.out.display()))?;
 
-    let mut input = TenxGuideInput::new(cli.raw, cli.filtered);
+    /*
+     * Use the same thread count for Rayon-based model fitting.
+     */
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(cli.threads.max(1))
+        .build_global()
+        .context("failed to initialize Rayon thread pool")?;
+
+    /*
+     * Build the 10x input.
+     */
+    let mut input = TenxGuideInput::new(
+        cli.raw,
+        cli.filtered,
+    );
+
     input.feature_type = cli.feature_type;
     input.threads = cli.threads;
 
-    let (raw_index, filtered_index) = input.indexes()?;
+    let (raw_index, filtered_index) =
+        input.indexes()?;
 
     eprintln!(
         "Found {} guide features; loading raw non-cell droplets...",
         raw_index.guides().len()
     );
 
-    let background_data = input.load_background(&raw_index)?;
+    /*
+     * ------------------------------------------------------------
+     * Ambient/background model
+     * ------------------------------------------------------------
+     */
+    let background_data =
+        input.load_background(&raw_index)?;
+
     let ambient = AmbientModel::fit(
         &background_data,
-        &BackgroundConfig {
-            alpha: cli.ambient_alpha,
-        },
+        &cli.model.background_config(),
     )?;
 
-    write_ambient(&cli.out, &raw_index, &ambient)?;
+    write_ambient(
+        &cli.out,
+        &raw_index,
+        &ambient,
+    )?;
 
-    // Deliberate phase boundary: only now do we load the actual called cells.
     eprintln!(
         "Ambient model fitted from {} droplets / {} guide UMIs; loading filtered cells...",
         ambient.background_droplets,
         ambient.total_umis
     );
 
-    let filtered = input.load_filtered(&filtered_index)?;
+    /*
+     * ------------------------------------------------------------
+     * Filtered biological cells
+     * ------------------------------------------------------------
+     */
+    let filtered =
+        input.load_filtered(&filtered_index)?;
 
-    let fit_cfg = FitConfig {
-        max_iterations: cli.max_iterations,
-        ..FitConfig::default()
-    };
-    let fitted = fit_mixture(&filtered, ambient, &fit_cfg)?;
+    /*
+     * ------------------------------------------------------------
+     * Ambient + genuine-guide mixture model
+     * ------------------------------------------------------------
+     */
+    let fit_cfg =
+        cli.model.fit_config();
 
-    eprintln!(
-        "Mixture model fitted in {} iterations; calling guide/cell observations...",
-        fitted.iterations
-    );
+    let fitted =
+        fit_mixture(
+            &filtered,
+            ambient,
+            &fit_cfg,
+        )?;
 
+    if fitted.biological_converged {
+        eprintln!(
+            "Guide assignments converged after {} iterations; calling guide/cell observations...",
+            fitted.iterations
+        );
+    } else if fitted.mathematical_converged {
+        eprintln!(
+            "Model parameters converged after {} iterations; calling guide/cell observations...",
+            fitted.iterations
+        );
+    } else {
+        eprintln!(
+            "WARNING: model stopped after {} iterations without convergence; calling guide/cell observations...",
+            fitted.iterations
+        );
+    }
+
+    /*
+     * ------------------------------------------------------------
+     * Final calls
+     * ------------------------------------------------------------
+     */
     let calls = GuideCalls::from_model(
         &fitted,
-        &CallConfig {
-            minimum_posterior: cli.posterior,
-            maximum_fdr: cli.fdr,
-        },
+        &cli.model.call_config(),
     );
 
-    let stats = collect_call_stats(&filtered, &calls);
+    /*
+     * ------------------------------------------------------------
+     * Summary statistics
+     * ------------------------------------------------------------
+     */
+    let stats =
+        collect_call_stats(
+            &filtered,
+            &calls,
+        );
 
-    println!("{}", stats.report_to_string());
+    println!(
+        "{}",
+        stats.report_to_string()
+    );
 
     stats.report_to_csv(
         cli.out
             .join("guide_call_stats.tsv")
             .to_str()
-            .context("output path is not valid UTF-8")?,
+            .context(
+                "output path is not valid UTF-8"
+            )?,
     );
 
-    write_calls(&cli.out, &filtered_index, &filtered, &calls)?;
-    write_guide_models(&cli.out, &filtered_index, &fitted)?;
+    /*
+     * ------------------------------------------------------------
+     * Detailed output
+     * ------------------------------------------------------------
+     */
+    write_calls(
+        &cli.out,
+        &filtered_index,
+        &filtered,
+        &calls,
+    )?;
 
-    let n_called = calls.flat.iter().filter(|x| x.called).count();
+    write_guide_models(
+        &cli.out,
+        &filtered_index,
+        &fitted,
+    )?;
+
+    write_cell_guide_assignments(
+        &cli.out,
+        &filtered_index,
+        &filtered,
+        &calls,
+    )?;
+
+    let n_called =
+        calls
+            .flat
+            .iter()
+            .filter(|call| call.called)
+            .count();
+
     eprintln!(
         "Done: {} observed cell-guide pairs, {} called genuine.",
         calls.flat.len(),
@@ -237,4 +333,141 @@ fn collect_call_stats(
     }
 
     stats
+}
+
+fn write_cell_guide_assignments(
+    out: &PathBuf,
+    index: &GuideFeatureIndex,
+    data: &GuideDataset,
+    calls: &GuideCalls,
+) -> Result<()> {
+    let path = out.join("cell_guide_assignments.tsv");
+
+    let mut writer = BufWriter::new(
+        File::create(&path)
+            .with_context(|| format!("creating {}", path.display()))?,
+    );
+
+    /*
+     * Lookup:
+     *
+     *     (cell_id, guide_id) -> GuideCall
+     *
+     * calls.flat contains the non-zero observed cell/guide combinations.
+     */
+    let call_lookup: HashMap<(u64, u32), _> = calls
+        .flat
+        .iter()
+        .map(|call| {
+            (
+                (call.cell_id, call.guide_id),
+                call,
+            )
+        })
+        .collect();
+
+    /*
+     * Header.
+     */
+    write!(
+        writer,
+        "barcode\tn_called_guides\tassignment\tcalled_guides"
+    )?;
+
+    for guide in index.guides() {
+        write!(
+            writer,
+            "\t{}_umi\t{}_posterior\t{}_qvalue\t{}_called",
+            guide.name,
+            guide.name,
+            guide.name,
+            guide.name,
+        )?;
+    }
+
+    writeln!(writer)?;
+
+    /*
+     * One row per filtered cell.
+     *
+     * data.cell_ids was constructed in barcode-file order by
+     * load_guide_dataset(), so this preserves filtered barcodes.tsv.gz order.
+     */
+    for &cell_id in &data.cell_ids {
+        let barcode = data
+            .barcode_by_id
+            .get(&cell_id)
+            .map(String::as_str)
+            .unwrap_or("UNKNOWN");
+
+        let mut called_guides = Vec::new();
+
+        /*
+         * Collect all genuinely called guides for this cell.
+         */
+        for (guide_id, guide) in index.guides().iter().enumerate() {
+            if let Some(call) =
+                call_lookup.get(&(cell_id, guide_id as u32))
+            {
+                if call.called {
+                    called_guides.push(guide.name.as_str());
+                }
+            }
+        }
+
+        let n_called = called_guides.len();
+
+        let assignment = match n_called {
+            0 => "none",
+            1 => "single",
+            _ => "multi",
+        };
+
+        /*
+         * barcode is already the ORIGINAL barcode string retained when
+         * barcodes.tsv.gz was read, including the 10x "-1" suffix.
+         *
+         * Do NOT append "-1" here.
+         */
+        write!(
+            writer,
+            "{}\t{}\t{}\t{}",
+            barcode,
+            n_called,
+            assignment,
+            called_guides.join(";"),
+        )?;
+
+        /*
+         * Evidence for every guide.
+         */
+        for guide_id in 0..index.guides().len() {
+            if let Some(call) =
+                call_lookup.get(&(cell_id, guide_id as u32))
+            {
+                write!(
+                    writer,
+                    "\t{}\t{:.8}\t{:.8e}\t{}",
+                    call.count,
+                    call.posterior_real,
+                    call.q_value,
+                    call.called,
+                )?;
+            } else {
+                /*
+                 * No molecules of this guide were observed in this cell.
+                 */
+                write!(
+                    writer,
+                    "\t0\t0.00000000\t1.00000000e0\tfalse"
+                )?;
+            }
+        }
+
+        writeln!(writer)?;
+    }
+
+    writer.flush()?;
+
+    Ok(())
 }

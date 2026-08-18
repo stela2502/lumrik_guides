@@ -17,7 +17,7 @@ pub struct FitConfig {
     // Biological convergence.
     pub posterior_tolerance: f64,
     pub stable_iterations_required: usize,
-    pub call_posterior_threshold: f64,
+    pub minimum_posterior: f64,
 
     pub initial_prior_real: f64,
     pub initial_dispersion: f64,
@@ -25,32 +25,6 @@ pub struct FitConfig {
     pub minimum_lambda: f64,
     pub prior_alpha: f64,
     pub prior_beta: f64,
-}
-
-impl Default for FitConfig {
-    fn default() -> Self {
-        Self {
-            max_iterations: 500,
-
-            tolerance: 1e-5,
-
-            // Posterior probabilities may move by at most 0.001.
-            posterior_tolerance: 1e-3,
-
-            // Require biological stability several times in a row.
-            stable_iterations_required: 5,
-
-            // cutoff for calling 
-            call_posterior_threshold: 0.95,
-
-            initial_prior_real: 0.05,
-            initial_dispersion: 10.0,
-            minimum_true_mean: 0.5,
-            minimum_lambda: 1e-6,
-            prior_alpha: 0.5,
-            prior_beta: 9.5,
-        }
-    }
 }
 
 
@@ -282,8 +256,8 @@ pub fn fit_mixture(
                     let current = state.posterior_real;
                     let delta = (current - *previous).abs();
 
-                    let previous_call = *previous >= cfg.call_posterior_threshold;
-                    let current_call = current >= cfg.call_posterior_threshold;
+                    let previous_call = *previous >= cfg.minimum_posterior;
+                    let current_call = current >= cfg.minimum_posterior;
 
                     let changed = usize::from(previous_call != current_call);
 
