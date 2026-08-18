@@ -6,13 +6,15 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 use clap::Parser;
 use lumrik_guides::background::{AmbientModel};
-use lumrik_guides::caller::{GuideCalls};
+use lumrik_guides::caller::{GuideCalls, GuideCall};
 use lumrik_guides::model::{fit_mixture};
 use lumrik_guides::tenx::TenxGuideInput;
 use lumrik_guides::cli::GuideModelCli;
 use lumrik_guides::{
     GuideDataset,
     GuideFeatureIndex,
+    MultiGuideGapStats,
+    MultiGuideGapStatsTable,
 };
 
 use mapping_info::MappingInfo;
@@ -210,6 +212,12 @@ fn main() -> Result<()> {
         &calls,
     )?;
 
+    let multi_gap_stats = MultiGuideGapStats::collect(
+        &filtered_index,
+        &filtered,
+        &calls,
+    );
+
     let n_called =
         calls
             .flat
@@ -222,6 +230,14 @@ fn main() -> Result<()> {
         calls.flat.len(),
         n_called
     );
+
+    eprintln!();
+    eprintln!("Multi-guide posterior-gap statistics");
+    multi_gap_stats.print_table();
+
+    multi_gap_stats.write_table(
+        &cli.out,
+    )?;
 
     Ok(())
 }
@@ -340,6 +356,58 @@ fn collect_call_stats(
     stats
 }
 
+
+#[derive(Debug)]
+struct RankedGuideEvidence<'a> {
+    best_guide: &'a str,
+    best_posterior: f64,
+    second_guide: &'a str,
+    second_posterior: f64,
+    posterior_gap: f64,
+}
+
+fn rank_guides_for_cell<'a>(
+    cell_id: u64,
+    index: &'a GuideFeatureIndex,
+    call_lookup: &HashMap<(u64, u32), &'a GuideCall>,
+) -> RankedGuideEvidence<'a> {
+    let mut ranked: Vec<(&str, f64)> = index
+        .guides()
+        .iter()
+        .enumerate()
+        .map(|(guide_id, guide)| {
+            let posterior = call_lookup
+                .get(&(cell_id, guide_id as u32))
+                .map(|call| call.posterior_real)
+                .unwrap_or(0.0);
+
+            (guide.name.as_str(), posterior)
+        })
+        .collect();
+
+    ranked.sort_unstable_by(|a, b| {
+        b.1.total_cmp(&a.1)
+    });
+
+    let (best_guide, best_posterior) = ranked
+        .first()
+        .copied()
+        .unwrap_or(("", 0.0));
+
+    let (second_guide, second_posterior) = ranked
+        .get(1)
+        .copied()
+        .unwrap_or(("", 0.0));
+
+    RankedGuideEvidence {
+        best_guide,
+        best_posterior,
+        second_guide,
+        second_posterior,
+        posterior_gap: best_posterior - second_posterior,
+    }
+}
+
 fn write_cell_guide_assignments(
     out: &PathBuf,
     index: &GuideFeatureIndex,
@@ -354,13 +422,16 @@ fn write_cell_guide_assignments(
     );
 
     /*
-     * Lookup:
+     * calls.flat contains only observed/non-zero cell-guide pairs.
      *
-     *     (cell_id, guide_id) -> GuideCall
+     * Missing pairs are interpreted as:
      *
-     * calls.flat contains the non-zero observed cell/guide combinations.
+     *   UMI       = 0
+     *   posterior = 0
+     *   q-value   = 1
+     *   called    = false
      */
-    let call_lookup: HashMap<(u64, u32), _> = calls
+    let call_lookup: HashMap<(u64, u32), &GuideCall> = calls
         .flat
         .iter()
         .map(|call| {
@@ -372,13 +443,26 @@ fn write_cell_guide_assignments(
         .collect();
 
     /*
-     * Header.
+     * Cell-level annotation columns.
      */
     write!(
         writer,
-        "barcode\tn_called_guides\tassignment\tcalled_guides"
+        concat!(
+            "barcode",
+            "\tn_called_guides",
+            "\tassignment",
+            "\tcalled_guides",
+            "\tbest_guide",
+            "\tbest_posterior",
+            "\tsecond_guide",
+            "\tsecond_posterior",
+            "\tposterior_gap"
+        )
     )?;
 
+    /*
+     * Per-guide evidence columns.
+     */
     for guide in index.guides() {
         write!(
             writer,
@@ -393,10 +477,7 @@ fn write_cell_guide_assignments(
     writeln!(writer)?;
 
     /*
-     * One row per filtered cell.
-     *
-     * data.cell_ids was constructed in barcode-file order by
-     * load_guide_dataset(), so this preserves filtered barcodes.tsv.gz order.
+     * data.cell_ids follows the original filtered barcodes.tsv.gz order.
      */
     for &cell_id in &data.cell_ids {
         let barcode = data
@@ -405,11 +486,11 @@ fn write_cell_guide_assignments(
             .map(String::as_str)
             .unwrap_or("UNKNOWN");
 
+        /*
+         * Collect all guides passing the actual final calling rule.
+         */
         let mut called_guides = Vec::new();
 
-        /*
-         * Collect all genuinely called guides for this cell.
-         */
         for (guide_id, guide) in index.guides().iter().enumerate() {
             if let Some(call) =
                 call_lookup.get(&(cell_id, guide_id as u32))
@@ -429,22 +510,34 @@ fn write_cell_guide_assignments(
         };
 
         /*
-         * barcode is already the ORIGINAL barcode string retained when
-         * barcodes.tsv.gz was read, including the 10x "-1" suffix.
+         * Rank ALL guides by posterior, not only called guides.
          *
-         * Do NOT append "-1" here.
+         * This is important for identifying cells where the second-best
+         * guide is close to the best guide even if it narrowly failed the
+         * final call threshold.
          */
+        let ranked = rank_guides_for_cell(
+            cell_id,
+            index,
+            &call_lookup,
+        );
+
         write!(
             writer,
-            "{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{:.8}\t{}\t{:.8}\t{:.8}",
             barcode,
             n_called,
             assignment,
             called_guides.join(";"),
+            ranked.best_guide,
+            ranked.best_posterior,
+            ranked.second_guide,
+            ranked.second_posterior,
+            ranked.posterior_gap,
         )?;
 
         /*
-         * Evidence for every guide.
+         * Detailed evidence for every guide.
          */
         for guide_id in 0..index.guides().len() {
             if let Some(call) =
@@ -459,9 +552,6 @@ fn write_cell_guide_assignments(
                     call.called,
                 )?;
             } else {
-                /*
-                 * No molecules of this guide were observed in this cell.
-                 */
                 write!(
                     writer,
                     "\t0\t0.00000000\t1.00000000e0\tfalse"
