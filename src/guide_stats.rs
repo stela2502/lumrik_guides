@@ -187,6 +187,10 @@ impl Display for MultiGuideGapStats {
 
 pub trait MultiGuideGapStatsTable {
     fn print_table(&self);
+    fn print_assignment_summary(
+        &self,
+        assignments: &CellGuideAssignments,
+    );
     fn write_table(
         &self,
         out: &PathBuf,
@@ -230,6 +234,162 @@ impl MultiGuideGapStatsTable for [MultiGuideGapStats] {
 
         Ok(())
     }
+
+    fn print_assignment_summary(
+	    &self,
+	    assignments: &CellGuideAssignments,
+	) {
+	    const LOG_ODDS_10: f64 = std::f64::consts::LN_10;
+	    const LOG_ODDS_100: f64 =
+	        2.0 * std::f64::consts::LN_10;
+
+	    let total = assignments.rows.len();
+
+	    let mut no_guide = 0usize;
+	    let mut single = 0usize;
+	    let mut multi = 0usize;
+
+	    let mut ambiguous = 0usize;
+	    let mut moderate = 0usize;
+	    let mut clear = 0usize;
+
+	    let mut min_gap = f64::INFINITY;
+
+	    for row in &assignments.rows {
+	        match row.n_called_guides {
+	            0 => {
+	                no_guide += 1;
+	            }
+
+	            1 => {
+	                single += 1;
+	            }
+
+	            _ => {
+	                multi += 1;
+
+	                let gap = row.log_odds_gap;
+
+	                if !gap.is_finite() {
+	                    continue;
+	                }
+
+	                min_gap = min_gap.min(gap);
+
+	                if gap < LOG_ODDS_10 {
+	                    ambiguous += 1;
+	                } else if gap < LOG_ODDS_100 {
+	                    moderate += 1;
+	                } else {
+	                    clear += 1;
+	                }
+	            }
+	        }
+	    }
+
+	    println!();
+	    println!("Guide assignment summary");
+	    println!("------------------------");
+
+	    println!(
+	        "{:<32} {:>8}  ({:>5.1}%)",
+	        "Total cells:",
+	        total,
+	        100.0,
+	    );
+
+	    println!(
+	        "{:<32} {:>8}  ({:>5.1}%)",
+	        "No guide assigned:",
+	        no_guide,
+	        percent(no_guide, total),
+	    );
+
+	    println!(
+	        "{:<32} {:>8}  ({:>5.1}%)",
+	        "Single guide called:",
+	        single,
+	        percent(single, total),
+	    );
+
+	    println!(
+	        "{:<32} {:>8}  ({:>5.1}%)",
+	        "Multiple guides called:",
+	        multi,
+	        percent(multi, total),
+	    );
+
+	    if multi == 0 {
+	        return;
+	    }
+
+	    println!();
+	    println!("Multi-guide resolution");
+	    println!("----------------------");
+
+	    println!(
+	        "{:<32} {:>8}  ({:>5.1}%)",
+	        "Clear best guide (>100:1):",
+	        clear,
+	        percent(clear, multi),
+	    );
+
+	    println!(
+	        "{:<32} {:>8}  ({:>5.1}%)",
+	        "Moderate separation (10-100:1):",
+	        moderate,
+	        percent(moderate, multi),
+	    );
+
+	    println!(
+	        "{:<32} {:>8}  ({:>5.1}%)",
+	        "Ambiguous best guide (<10:1):",
+	        ambiguous,
+	        percent(ambiguous, multi),
+	    );
+
+	    /*
+	     * `self` already contains the distribution statistics.
+	     *
+	     * The ALL row is the combined multi-guide population.
+	     */
+	    if let Some(all) = self
+	        .iter()
+	        .find(|stats| stats.n_called_guides().is_none())
+	    {
+	        println!();
+	        println!("Best-vs-second evidence");
+	        println!("-----------------------");
+
+	        println!(
+	            "{:<32} {:>12.2}",
+	            "Median log-odds difference:",
+	            all.median(),
+	        );
+
+	        println!(
+	            "{:<32} {:>12.2}",
+	            "Q1 log-odds difference:",
+	            all.q1(),
+	        );
+
+	        println!(
+	            "{:<32} {:>12.2}",
+	            "Smallest log-odds difference:",
+	            all.min(),
+	        );
+	    }
+
+	    if min_gap.is_finite() && min_gap < 700.0 {
+	        println!(
+	            "{:<32} {:>12.1}:1",
+	            "Weakest odds advantage:",
+	            min_gap.exp(),
+	        );
+	    }
+
+	    println!();
+	}
 }
 
 
@@ -270,4 +430,19 @@ fn quantile(
     values[lower]
         + fraction
             * (values[upper] - values[lower])
+}
+
+
+
+fn percent(
+    value: usize,
+    total: usize,
+) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        value as f64
+            / total as f64
+            * 100.0
+    }
 }

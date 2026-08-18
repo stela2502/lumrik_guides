@@ -210,7 +210,9 @@ fn main() -> Result<()> {
 
     println!();
 
-    multi_gap_stats.print_table();
+    multi_gap_stats.print_assignment_summary(
+        &assignments,
+    );
 
     multi_gap_stats.write_table(
         &cli.out,
@@ -235,4 +237,19 @@ fn main() -> Result<()> {
     );
 
     Ok(())
+}
+
+
+
+fn percent(
+    value: usize,
+    total: usize,
+) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        value as f64
+            / total as f64
+            * 100.0
+    }
 }
