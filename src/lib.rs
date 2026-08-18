@@ -8,6 +8,7 @@ pub mod tenx;
 pub mod cli;
 pub mod cell_guide_assignments;
 pub mod reporting;
+pub mod utils;
 
 pub use background::{AmbientModel, BackgroundConfig};
 pub use caller::{CallConfig, GuideCall, GuideCalls};

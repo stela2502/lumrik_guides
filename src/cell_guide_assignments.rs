@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use crate::caller::{GuideCall, GuideCalls};
 use crate::dataset::GuideDataset;
 use crate::tenx::GuideFeatureIndex;
+use crate::utils::{ percent};
 
 #[derive(Debug, Clone)]
 pub struct GuideEvidence {
@@ -77,6 +78,20 @@ impl CellGuideAssignment {
     pub fn is_multi(&self) -> bool {
         self.n_called_guides >= 2
     }
+
+    pub fn has_clear_primary_guide(
+        &self,
+        minimum_odds_ratio: f64,
+    ) -> bool {
+        if self.n_called_guides == 0 {
+            return false;
+        }
+
+        let minimum_log_odds_gap =
+            minimum_odds_ratio.ln();
+
+        self.log_odds_gap >= minimum_log_odds_gap
+    }
 }
 
 
@@ -123,6 +138,75 @@ impl CellGuideAssignments {
             guide_names,
         }
     }
+
+    pub fn primary_guide_summary(
+        &self,
+        minimum_odds_ratio: f64,
+    ) -> String {
+        use std::fmt::Write;
+
+        let guide_positive = self
+            .rows
+            .iter()
+            .filter(|row| row.n_called_guides > 0)
+            .count();
+
+        let clear = self
+            .rows
+            .iter()
+            .filter(|row| {
+                row.has_clear_primary_guide(
+                    minimum_odds_ratio,
+                )
+            })
+            .count();
+
+        let ambiguous =
+            guide_positive - clear;
+
+        let mut out = String::new();
+
+        writeln!(out).unwrap();
+
+        writeln!(
+            out,
+            "Primary-guide RNA analysis eligibility"
+        ).unwrap();
+
+        writeln!(
+            out,
+            "--------------------------------------"
+        ).unwrap();
+
+        writeln!(
+            out,
+            "{:<34} {:>8}",
+            "Guide-positive cells:",
+            guide_positive,
+        ).unwrap();
+
+        writeln!(
+            out,
+            "{:<34} {:>8}  ({:>5.1}%)",
+            format!(
+                "Clear primary guide (>{:.0}:1):",
+                minimum_odds_ratio
+            ),
+            clear,
+            percent(clear, guide_positive),
+        ).unwrap();
+
+        writeln!(
+            out,
+            "{:<34} {:>8}  ({:>5.1}%)",
+            "Excluded as ambiguous:",
+            ambiguous,
+            percent(ambiguous, guide_positive),
+        ).unwrap();
+
+        out
+    }
+
 
     fn build_row(
         cell_id: u64,

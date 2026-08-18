@@ -6,6 +6,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
+use crate::utils::{quantile, percent};
+
 use crate::cell_guide_assignments::CellGuideAssignments;
 
 #[derive(Debug, Clone)]
@@ -187,10 +189,18 @@ impl Display for MultiGuideGapStats {
 
 pub trait MultiGuideGapStatsTable {
     fn print_table(&self);
+
     fn print_assignment_summary(
         &self,
         assignments: &CellGuideAssignments,
-    );
+    ) -> String;
+
+    fn primary_guide_counts(
+        &self,
+        assignments: &CellGuideAssignments,
+        minimum_odds_ratio: f64,
+    ) -> String;
+
     fn write_table(
         &self,
         out: &PathBuf,
@@ -235,10 +245,89 @@ impl MultiGuideGapStatsTable for [MultiGuideGapStats] {
         Ok(())
     }
 
-    fn print_assignment_summary(
+    fn primary_guide_counts(
 	    &self,
 	    assignments: &CellGuideAssignments,
-	) {
+	    minimum_odds_ratio: f64,
+	) -> String {
+	    use std::collections::BTreeMap;
+	    use std::fmt::Write;
+
+	    let minimum_log_odds_gap =
+	        minimum_odds_ratio.ln();
+
+	    let mut best_guide_counts:
+	        BTreeMap<&str, usize> =
+	        BTreeMap::new();
+
+	    for assignment in &assignments.rows {
+	        if assignment.n_called_guides == 0 {
+	            continue;
+	        }
+
+	        if assignment.log_odds_gap
+	            < minimum_log_odds_gap
+	        {
+	            continue;
+	        }
+
+	        *best_guide_counts
+	            .entry(
+	                assignment.best_guide.as_str()
+	            )
+	            .or_default() += 1;
+	    }
+
+	    let total_confident: usize =
+	        best_guide_counts
+	            .values()
+	            .sum();
+
+	    let mut out =
+	        String::new();
+
+	    writeln!(
+	        out,
+	        "\nHigh-confidence primary-guide counts"
+	    ).unwrap();
+
+	    writeln!(
+	        out,
+	        "------------------------------------"
+	    ).unwrap();
+
+	    writeln!(
+	        out,
+	        "{:<32} {:>8}",
+	        "guide",
+	        "cells",
+	    ).unwrap();
+
+	    for (guide, count) in &best_guide_counts {
+	        writeln!(
+	            out,
+	            "{:<32} {:>8}",
+	            guide,
+	            count,
+	        ).unwrap();
+	    }
+
+	    writeln!(
+	        out,
+	        "{:<32} {:>8}",
+	        "TOTAL",
+	        total_confident,
+	    ).unwrap();
+
+	    out
+	}
+
+	fn print_assignment_summary(
+	    &self,
+	    assignments: &CellGuideAssignments,
+	) -> String {
+	    use std::fmt::Write;
+
 	    const LOG_ODDS_10: f64 = std::f64::consts::LN_10;
 	    const LOG_ODDS_100: f64 =
 	        2.0 * std::f64::consts::LN_10;
@@ -287,66 +376,82 @@ impl MultiGuideGapStatsTable for [MultiGuideGapStats] {
 	        }
 	    }
 
-	    println!();
-	    println!("Guide assignment summary");
-	    println!("------------------------");
+	    let mut out = String::new();
 
-	    println!(
+	    writeln!(out).unwrap();
+	    writeln!(out, "Guide assignment summary").unwrap();
+	    writeln!(out, "------------------------").unwrap();
+
+	    writeln!(
+	        out,
 	        "{:<32} {:>8}  ({:>5.1}%)",
 	        "Total cells:",
 	        total,
 	        100.0,
-	    );
+	    )
+	    .unwrap();
 
-	    println!(
+	    writeln!(
+	        out,
 	        "{:<32} {:>8}  ({:>5.1}%)",
 	        "No guide assigned:",
 	        no_guide,
 	        percent(no_guide, total),
-	    );
+	    )
+	    .unwrap();
 
-	    println!(
+	    writeln!(
+	        out,
 	        "{:<32} {:>8}  ({:>5.1}%)",
 	        "Single guide called:",
 	        single,
 	        percent(single, total),
-	    );
+	    )
+	    .unwrap();
 
-	    println!(
+	    writeln!(
+	        out,
 	        "{:<32} {:>8}  ({:>5.1}%)",
 	        "Multiple guides called:",
 	        multi,
 	        percent(multi, total),
-	    );
+	    )
+	    .unwrap();
 
 	    if multi == 0 {
-	        return;
+	        return out;
 	    }
 
-	    println!();
-	    println!("Multi-guide resolution");
-	    println!("----------------------");
+	    writeln!(out).unwrap();
+	    writeln!(out, "Multi-guide resolution").unwrap();
+	    writeln!(out, "----------------------").unwrap();
 
-	    println!(
+	    writeln!(
+	        out,
 	        "{:<32} {:>8}  ({:>5.1}%)",
 	        "Clear best guide (>100:1):",
 	        clear,
 	        percent(clear, multi),
-	    );
+	    )
+	    .unwrap();
 
-	    println!(
+	    writeln!(
+	        out,
 	        "{:<32} {:>8}  ({:>5.1}%)",
 	        "Moderate separation (10-100:1):",
 	        moderate,
 	        percent(moderate, multi),
-	    );
+	    )
+	    .unwrap();
 
-	    println!(
+	    writeln!(
+	        out,
 	        "{:<32} {:>8}  ({:>5.1}%)",
 	        "Ambiguous best guide (<10:1):",
 	        ambiguous,
 	        percent(ambiguous, multi),
-	    );
+	    )
+	    .unwrap();
 
 	    /*
 	     * `self` already contains the distribution statistics.
@@ -357,92 +462,49 @@ impl MultiGuideGapStatsTable for [MultiGuideGapStats] {
 	        .iter()
 	        .find(|stats| stats.n_called_guides().is_none())
 	    {
-	        println!();
-	        println!("Best-vs-second evidence");
-	        println!("-----------------------");
+	        writeln!(out).unwrap();
+	        writeln!(out, "Best-vs-second evidence").unwrap();
+	        writeln!(out, "-----------------------").unwrap();
 
-	        println!(
+	        writeln!(
+	            out,
 	            "{:<32} {:>12.2}",
 	            "Median log-odds difference:",
 	            all.median(),
-	        );
+	        )
+	        .unwrap();
 
-	        println!(
+	        writeln!(
+	            out,
 	            "{:<32} {:>12.2}",
 	            "Q1 log-odds difference:",
 	            all.q1(),
-	        );
+	        )
+	        .unwrap();
 
-	        println!(
+	        writeln!(
+	            out,
 	            "{:<32} {:>12.2}",
 	            "Smallest log-odds difference:",
 	            all.min(),
-	        );
+	        )
+	        .unwrap();
 	    }
 
 	    if min_gap.is_finite() && min_gap < 700.0 {
-	        println!(
+	        writeln!(
+	            out,
 	            "{:<32} {:>12.1}:1",
 	            "Weakest odds advantage:",
 	            min_gap.exp(),
-	        );
+	        )
+	        .unwrap();
 	    }
 
-	    println!();
+	    writeln!(out).unwrap();
+
+	    out
 	}
 }
 
 
-fn quantile(
-    values: &[f64],
-    q: f64,
-) -> f64 {
-    assert!(
-        !values.is_empty(),
-        "cannot calculate quantile of empty data"
-    );
-
-    assert!(
-        (0.0..=1.0).contains(&q),
-        "quantile must be between 0 and 1"
-    );
-
-    if values.len() == 1 {
-        return values[0];
-    }
-
-    let position =
-        q * (values.len() - 1) as f64;
-
-    let lower =
-        position.floor() as usize;
-
-    let upper =
-        position.ceil() as usize;
-
-    if lower == upper {
-        return values[lower];
-    }
-
-    let fraction =
-        position - lower as f64;
-
-    values[lower]
-        + fraction
-            * (values[upper] - values[lower])
-}
-
-
-
-fn percent(
-    value: usize,
-    total: usize,
-) -> f64 {
-    if total == 0 {
-        0.0
-    } else {
-        value as f64
-            / total as f64
-            * 100.0
-    }
-}

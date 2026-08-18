@@ -210,13 +210,55 @@ fn main() -> Result<()> {
 
     println!();
 
+
+
+    let main_log =
     multi_gap_stats.print_assignment_summary(
         &assignments,
     );
 
+    let guide_summary =
+        multi_gap_stats.primary_guide_counts(
+            &assignments,
+            100.0,
+        );
+
+    let run_log = format!(
+        "{}\n{}",
+        main_log,
+        guide_summary,
+    );
+
+    
+    /*
+     * Human-readable stdout.
+     */
+    println!("{run_log}");
+
+    /*
+     * Human-readable run log.
+     */
+    std::fs::write(
+        cli.out.join("lumrik_guides.log"),
+        &run_log,
+    )
+    .with_context(|| {
+        format!(
+            "writing {}",
+            cli.out
+                .join("lumrik_guides.log")
+                .display()
+        )
+    })?;
+
+    /*
+     * Detailed machine-readable statistics.
+     */
     multi_gap_stats.write_table(
         &cli.out,
     )?;
+    
+
 
     /*
      * ------------------------------------------------------------
@@ -240,16 +282,3 @@ fn main() -> Result<()> {
 }
 
 
-
-fn percent(
-    value: usize,
-    total: usize,
-) -> f64 {
-    if total == 0 {
-        0.0
-    } else {
-        value as f64
-            / total as f64
-            * 100.0
-    }
-}
